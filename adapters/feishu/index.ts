@@ -18,11 +18,11 @@ import {
   formatImHelp,
   formatImStatus,
   splitMessage,
-  truncateInput,
 } from '../common/format.js'
 import { SessionStore } from '../common/session-store.js'
 import { AdapterHttpClient, type RecentProject } from '../common/http-client.js'
 import { isAllowedUser, tryPair } from '../common/pairing.js'
+import { optimizeMarkdownForFeishu } from './markdown-style.js'
 
 // ---------- init ----------
 
@@ -221,15 +221,22 @@ async function sendCard(chatId: string, card: Record<string, unknown>): Promise<
   }
 }
 
-/** Build a simple streaming text card (Schema 1.0, patchable via im.message.patch). */
+/** Build a simple streaming text card (Schema 1.0, patchable via im.message.patch).
+ *
+ *  The `content` is run through `optimizeMarkdownForFeishu` first: Feishu's
+ *  `tag:'markdown'` element has a known rendering bug where H1~H3 headings
+ *  (`#`, `##`, `###`) show up as literal text instead of being styled.
+ *  openclaw-lark works around this in `src/card/markdown-style.ts` by
+ *  downgrading H1→H4 and H2~H6→H5. We do the same here. */
 function buildStreamingCard(text: string): Record<string, unknown> {
+  const content = optimizeMarkdownForFeishu(text || ' ')
   return {
     config: {
       wide_screen_mode: true,
       update_multi: true,
     },
     elements: [
-      { tag: 'markdown', content: text || ' ' },
+      { tag: 'markdown', content },
     ],
   }
 }
@@ -361,40 +368,217 @@ function buildProjectPickerCard(projects: RecentProject[]): Record<string, unkno
   }
 }
 
-/** Build a permission request card. */
-function buildPermissionCard(toolName: string, input: unknown, requestId: string): Record<string, unknown> {
-  const truncated = truncateInput(input, 300)
+/** Human-readable summary of a tool call for display in the permission card. */
+type ToolCallSummary = {
+  icon: string
+  label: string
+  /** Display string for the operation target (file path or command preview) */
+  target?: string
+  /** Absolute file path for cross-directory detection, when applicable */
+  filePath?: string
+}
 
-  return {
-    schema: '2.0',
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: '🔐 需要权限确认' },
-      template: 'orange',
+/** Map a Claude Code tool call to an icon + human-readable Chinese label.
+ *  Unknown tools fall back to the raw tool name with a generic icon. */
+function summarizeToolCall(toolName: string, input: unknown): ToolCallSummary {
+  const rec: Record<string, unknown> =
+    input && typeof input === 'object' ? (input as Record<string, unknown>) : {}
+  const str = (key: string): string | undefined =>
+    typeof rec[key] === 'string' ? (rec[key] as string) : undefined
+
+  switch (toolName) {
+    case 'Write': {
+      const fp = str('file_path')
+      return { icon: '✏️', label: '写入文件', target: fp, filePath: fp }
+    }
+    case 'Edit':
+    case 'MultiEdit':
+    case 'NotebookEdit': {
+      const fp = str('file_path') ?? str('notebook_path')
+      return { icon: '✏️', label: '修改文件', target: fp, filePath: fp }
+    }
+    case 'Read': {
+      const fp = str('file_path')
+      return { icon: '📖', label: '读取文件', target: fp, filePath: fp }
+    }
+    case 'Bash':
+    case 'BashOutput': {
+      return { icon: '🖥️', label: '执行命令', target: str('command') }
+    }
+    case 'Grep': {
+      const pattern = str('pattern')
+      return {
+        icon: '🔍',
+        label: '搜索内容',
+        target: pattern ? `pattern: ${pattern}` : undefined,
+        filePath: str('path'),
+      }
+    }
+    case 'Glob': {
+      const pattern = str('pattern')
+      return {
+        icon: '📁',
+        label: '查找文件',
+        target: pattern ? `pattern: ${pattern}` : undefined,
+        filePath: str('path'),
+      }
+    }
+    case 'WebFetch':
+      return { icon: '🌐', label: '访问网页', target: str('url') }
+    case 'WebSearch':
+      return { icon: '🌐', label: '搜索网页', target: str('query') }
+    default:
+      return { icon: '🔧', label: toolName }
+  }
+}
+
+/** True if `filePath` resolves to a location outside of `workDir`.
+ *  Relative paths are resolved against workDir first. */
+function isOutsideWorkDir(filePath: string, workDir: string): boolean {
+  const abs = path.isAbsolute(filePath)
+    ? path.normalize(filePath)
+    : path.resolve(workDir, filePath)
+  const normWork = path.normalize(workDir).replace(/\/+$/, '')
+  return abs !== normWork && !abs.startsWith(normWork + path.sep)
+}
+
+/** Truncate a single-line target preview (e.g. shell command) to maxLen. */
+function truncateTarget(s: string, maxLen = 160): string {
+  if (s.length <= maxLen) return s
+  return s.slice(0, maxLen - 1) + '…'
+}
+
+/** Build a permission request card (Schema 2.0, mobile-friendly).
+ *
+ *  Layout:
+ *    header  →  🔐 需要权限确认 (orange / red if cross-dir)
+ *    body    →  <icon> **<label>**  `<toolName>`
+ *              ```
+ *              <target>           (path or command, if present)
+ *              ```
+ *              ⚠️ 跨目录警告        (only when filePath escapes workDir)
+ *              ────
+ *              [ ✅ 允许 | ♾️ 永久允许 | ❌ 拒绝 ]
+ *
+ *  The 永久允许 button carries `rule: 'always'` in its value — the server
+ *  turns that into `updatedPermissions` using the CLI's permission_suggestions,
+ *  so the same tool call won't prompt again in this session. */
+function buildPermissionCard(
+  toolName: string,
+  input: unknown,
+  requestId: string,
+  workDir?: string,
+): Record<string, unknown> {
+  const summary = summarizeToolCall(toolName, input)
+  const crossDir = Boolean(
+    workDir && summary.filePath && isOutsideWorkDir(summary.filePath, workDir),
+  )
+
+  const elements: Record<string, unknown>[] = [
+    // Header line: icon + human label + raw tool tag
+    {
+      tag: 'markdown',
+      content: `${summary.icon} **${summary.label}**  \`${toolName}\``,
     },
-    elements: [
+  ]
+
+  // Target preview (file path / command / url …)
+  if (summary.target) {
+    const shown = summary.filePath
+      ? prettyPath(summary.target, 80)
+      : truncateTarget(summary.target, 160)
+    elements.push({
+      tag: 'markdown',
+      content: '```\n' + shown + '\n```',
+      margin: '4px 0 0 0',
+    })
+  }
+
+  // Cross-directory warning (only when the file escapes the session's workDir)
+  if (crossDir) {
+    elements.push({
+      tag: 'markdown',
+      content: '⚠️ **该操作位于当前项目目录之外**',
+      margin: '8px 0 0 0',
+      text_size: 'notation',
+    })
+  }
+
+  // Divider
+  elements.push({ tag: 'hr', margin: '12px 0 0 0' })
+
+  // Action row — three equal columns: 允许 / 永久允许 / 拒绝
+  elements.push({
+    tag: 'column_set',
+    flex_mode: 'stretch',
+    horizontal_spacing: '8px',
+    margin: '8px 0 0 0',
+    columns: [
       {
-        tag: 'markdown',
-        content: `**工具**: ${toolName}\n**内容**:\n\`\`\`\n${truncated}\n\`\`\``,
-      },
-      {
-        tag: 'action',
-        actions: [
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        vertical_align: 'center',
+        elements: [
           {
             tag: 'button',
             text: { tag: 'plain_text', content: '✅ 允许' },
             type: 'primary',
+            size: 'medium',
             value: { action: 'permit', requestId, allowed: true },
           },
+        ],
+      },
+      {
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        vertical_align: 'center',
+        elements: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '♾️ 永久允许' },
+            type: 'default',
+            size: 'medium',
+            value: { action: 'permit', requestId, allowed: true, rule: 'always' },
+          },
+        ],
+      },
+      {
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        vertical_align: 'center',
+        elements: [
           {
             tag: 'button',
             text: { tag: 'plain_text', content: '❌ 拒绝' },
             type: 'danger',
+            size: 'medium',
             value: { action: 'permit', requestId, allowed: false },
           },
         ],
       },
     ],
+  })
+
+  return {
+    schema: '2.0',
+    config: {
+      wide_screen_mode: false,
+      update_multi: true,
+    },
+    header: {
+      title: { tag: 'plain_text', content: '🔐 需要权限确认' },
+      subtitle: {
+        tag: 'plain_text',
+        content: crossDir ? '⚠️ 跨目录操作' : toolName,
+      },
+      template: crossDir ? 'red' : 'orange',
+      padding: '12px 12px 12px 12px',
+      icon: { tag: 'standard_icon', token: 'lock-chat_filled' },
+    },
+    body: { elements },
   }
 }
 
@@ -412,9 +596,14 @@ async function flushToFeishu(chatId: string, newText: string, isComplete: boolea
 
   if (isComplete) {
     if (!state.replyMessageId && fullText.trim()) {
+      // Fallback path: no streaming card was created for this text block
+      // (e.g. sendCard failed, or upstream never fired content_start{text}).
+      // Must go through sendCard(buildStreamingCard), NOT sendText — the
+      // latter uses msg_type=post + tag:'md' which is INLINE-ONLY and won't
+      // render block-level markdown (#, ```fenced```, tables, lists).
       const chunks = splitMessage(fullText, 30000)
       for (const chunk of chunks) {
-        await sendText(chatId, chunk)
+        await sendCard(chatId, buildStreamingCard(chunk))
       }
     }
     accumulatedText.delete(chatId)
@@ -600,7 +789,13 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
     case 'permission_request': {
       runtime.pendingPermissionCount += 1
       runtime.state = 'permission_pending'
-      const card = buildPermissionCard(msg.toolName, msg.input, msg.requestId)
+      const stored = sessionStore.get(chatId)
+      const card = buildPermissionCard(
+        msg.toolName,
+        msg.input,
+        msg.requestId,
+        stored?.workDir,
+      )
       await sendCard(chatId, card)
       break
     }
@@ -792,6 +987,7 @@ async function handleCardAction(data: any): Promise<any> {
         action?: string
         requestId?: string
         allowed?: boolean
+        rule?: string
         realPath?: string
         projectName?: string
       }
@@ -806,15 +1002,20 @@ async function handleCardAction(data: any): Promise<any> {
   if (action === 'permit') {
     const requestId = event.action?.value?.requestId
     const allowed = event.action?.value?.allowed ?? false
+    const rule = event.action?.value?.rule
     if (!requestId) return
 
-    bridge.sendPermissionResponse(chatId, requestId, allowed)
+    bridge.sendPermissionResponse(chatId, requestId, allowed, rule)
     const runtime = getRuntimeState(chatId)
     runtime.pendingPermissionCount = Math.max(0, runtime.pendingPermissionCount - 1)
 
-    const statusText = allowed ? '✅ 已允许' : '❌ 已拒绝'
+    const statusText = allowed
+      ? rule === 'always'
+        ? '♾️ 已永久允许（本次会话内不再询问相同操作）'
+        : '✅ 已允许'
+      : '❌ 已拒绝'
     await sendText(chatId, statusText)
-    return { toast: { type: 'info', content: statusText } }
+    return { toast: { type: 'info', content: allowed ? (rule === 'always' ? '♾️ 永久允许' : '✅ 已允许') : '❌ 已拒绝' } }
   }
 
   if (action === 'pick_project') {

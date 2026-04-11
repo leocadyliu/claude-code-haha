@@ -32,6 +32,10 @@ export class WsBridge {
   private sessions = new Map<string, Session>()
   /** Single handler per chatId — separate from sessions so reconnect doesn't duplicate */
   private handlers = new Map<string, MessageHandler>()
+  /** Per-chat FIFO queue of in-flight handler promises.
+   *  Ensures an async handler for message N completes before handler for N+1
+   *  starts, preventing state races at `await` points. */
+  private handlerChains = new Map<string, Promise<void>>()
   private serverUrl: string
   private platform: string
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
@@ -58,9 +62,25 @@ export class WsBridge {
     return this.send(chatId, { type: 'user_message', content })
   }
 
-  /** Respond to a permission request. */
-  sendPermissionResponse(chatId: string, requestId: string, allowed: boolean): boolean {
-    return this.send(chatId, { type: 'permission_response', requestId, allowed })
+  /** Respond to a permission request.
+   *
+   * @param rule - optional rule name to make the permission persistent.
+   *   Currently the server supports `'always'`, which uses the CLI's
+   *   permission_suggestions to produce updatedPermissions so the same
+   *   tool call won't prompt again in this session. Omit for one-shot allow. */
+  sendPermissionResponse(
+    chatId: string,
+    requestId: string,
+    allowed: boolean,
+    rule?: string,
+  ): boolean {
+    const message: Record<string, unknown> = {
+      type: 'permission_response',
+      requestId,
+      allowed,
+    }
+    if (rule) message.rule = rule
+    return this.send(chatId, message)
   }
 
   /** Stop the current generation. */
@@ -82,6 +102,7 @@ export class WsBridge {
       this.sessions.delete(chatId)
     }
     this.handlers.delete(chatId)
+    this.handlerChains.delete(chatId)
   }
 
   /** Has a session (connected or handler registered) for chatId. */
@@ -102,6 +123,7 @@ export class WsBridge {
     }
     this.sessions.clear()
     this.handlers.clear()
+    this.handlerChains.clear()
   }
 
   // ------- internal -------
@@ -131,14 +153,30 @@ export class WsBridge {
     })
 
     ws.on('message', (raw) => {
+      let msg: ServerMessage
       try {
-        const msg: ServerMessage = JSON.parse(raw.toString())
-        if (msg.type === 'pong') return
-        const handler = this.handlers.get(chatId)
-        if (handler) handler(msg)
+        msg = JSON.parse(raw.toString())
       } catch (err) {
         console.error('[WsBridge] Parse error:', err)
+        return
       }
+      if (msg.type === 'pong') return
+      const handler = this.handlers.get(chatId)
+      if (!handler) return
+
+      // Serialize per-chat handler calls: chain each message onto the previous
+      // one so a slow handler (e.g. one awaiting im.message.create) fully
+      // finishes before the next message's handler runs. This prevents state
+      // races where a later message reads stale map entries set up by an
+      // earlier-but-still-in-flight handler.
+      const prev = this.handlerChains.get(chatId) ?? Promise.resolve()
+      const next = prev
+        .catch(() => {}) // upstream errors must not poison the chain
+        .then(() => Promise.resolve().then(() => handler(msg)))
+        .catch((err) => {
+          console.error(`[WsBridge] Handler error on ${chatId}:`, err)
+        })
+      this.handlerChains.set(chatId, next)
     })
 
     ws.on('close', (code, reason) => {

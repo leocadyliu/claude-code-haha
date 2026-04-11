@@ -5,6 +5,7 @@
  */
 
 import { describe, it, expect } from 'bun:test'
+import * as path from 'node:path'
 
 // ---------- helpers extracted from feishu/index.ts for testability ----------
 
@@ -147,40 +148,191 @@ function buildProjectPickerCard(projects: RecentProject[]): Record<string, unkno
   }
 }
 
-function buildPermissionCard(toolName: string, input: unknown, requestId: string): Record<string, unknown> {
-  const preview = typeof input === 'string' ? input : JSON.stringify(input, null, 2)
-  const truncated = preview.length > 300 ? preview.slice(0, 300) + '…' : preview
+// ---------- permission card helpers (mirrored from feishu/index.ts) ----------
 
-  return {
-    schema: '2.0',
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: '🔐 需要权限确认' },
-      template: 'orange',
+type ToolCallSummary = {
+  icon: string
+  label: string
+  target?: string
+  filePath?: string
+}
+
+function summarizeToolCall(toolName: string, input: unknown): ToolCallSummary {
+  const rec: Record<string, unknown> =
+    input && typeof input === 'object' ? (input as Record<string, unknown>) : {}
+  const str = (key: string): string | undefined =>
+    typeof rec[key] === 'string' ? (rec[key] as string) : undefined
+
+  switch (toolName) {
+    case 'Write': {
+      const fp = str('file_path')
+      return { icon: '✏️', label: '写入文件', target: fp, filePath: fp }
+    }
+    case 'Edit':
+    case 'MultiEdit':
+    case 'NotebookEdit': {
+      const fp = str('file_path') ?? str('notebook_path')
+      return { icon: '✏️', label: '修改文件', target: fp, filePath: fp }
+    }
+    case 'Read': {
+      const fp = str('file_path')
+      return { icon: '📖', label: '读取文件', target: fp, filePath: fp }
+    }
+    case 'Bash':
+    case 'BashOutput': {
+      return { icon: '🖥️', label: '执行命令', target: str('command') }
+    }
+    case 'Grep': {
+      const pattern = str('pattern')
+      return {
+        icon: '🔍',
+        label: '搜索内容',
+        target: pattern ? `pattern: ${pattern}` : undefined,
+        filePath: str('path'),
+      }
+    }
+    case 'Glob': {
+      const pattern = str('pattern')
+      return {
+        icon: '📁',
+        label: '查找文件',
+        target: pattern ? `pattern: ${pattern}` : undefined,
+        filePath: str('path'),
+      }
+    }
+    case 'WebFetch':
+      return { icon: '🌐', label: '访问网页', target: str('url') }
+    case 'WebSearch':
+      return { icon: '🌐', label: '搜索网页', target: str('query') }
+    default:
+      return { icon: '🔧', label: toolName }
+  }
+}
+
+function isOutsideWorkDir(filePath: string, workDir: string): boolean {
+  const abs = path.isAbsolute(filePath)
+    ? path.normalize(filePath)
+    : path.resolve(workDir, filePath)
+  const normWork = path.normalize(workDir).replace(/\/+$/, '')
+  return abs !== normWork && !abs.startsWith(normWork + path.sep)
+}
+
+function truncateTarget(s: string, maxLen = 160): string {
+  if (s.length <= maxLen) return s
+  return s.slice(0, maxLen - 1) + '…'
+}
+
+function buildPermissionCard(
+  toolName: string,
+  input: unknown,
+  requestId: string,
+  workDir?: string,
+): Record<string, unknown> {
+  const summary = summarizeToolCall(toolName, input)
+  const crossDir = Boolean(
+    workDir && summary.filePath && isOutsideWorkDir(summary.filePath, workDir),
+  )
+
+  const elements: Record<string, unknown>[] = [
+    {
+      tag: 'markdown',
+      content: `${summary.icon} **${summary.label}**  \`${toolName}\``,
     },
-    elements: [
+  ]
+
+  if (summary.target) {
+    const shown = summary.filePath
+      ? prettyPath(summary.target, 80)
+      : truncateTarget(summary.target, 160)
+    elements.push({
+      tag: 'markdown',
+      content: '```\n' + shown + '\n```',
+      margin: '4px 0 0 0',
+    })
+  }
+
+  if (crossDir) {
+    elements.push({
+      tag: 'markdown',
+      content: '⚠️ **该操作位于当前项目目录之外**',
+      margin: '8px 0 0 0',
+      text_size: 'notation',
+    })
+  }
+
+  elements.push({ tag: 'hr', margin: '12px 0 0 0' })
+
+  elements.push({
+    tag: 'column_set',
+    flex_mode: 'stretch',
+    horizontal_spacing: '8px',
+    margin: '8px 0 0 0',
+    columns: [
       {
-        tag: 'markdown',
-        content: `**工具**: ${toolName}\n**内容**:\n\`\`\`\n${truncated}\n\`\`\``,
-      },
-      {
-        tag: 'action',
-        actions: [
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        vertical_align: 'center',
+        elements: [
           {
             tag: 'button',
             text: { tag: 'plain_text', content: '✅ 允许' },
             type: 'primary',
+            size: 'medium',
             value: { action: 'permit', requestId, allowed: true },
           },
+        ],
+      },
+      {
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        vertical_align: 'center',
+        elements: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '♾️ 永久允许' },
+            type: 'default',
+            size: 'medium',
+            value: { action: 'permit', requestId, allowed: true, rule: 'always' },
+          },
+        ],
+      },
+      {
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        vertical_align: 'center',
+        elements: [
           {
             tag: 'button',
             text: { tag: 'plain_text', content: '❌ 拒绝' },
             type: 'danger',
+            size: 'medium',
             value: { action: 'permit', requestId, allowed: false },
           },
         ],
       },
     ],
+  })
+
+  return {
+    schema: '2.0',
+    config: {
+      wide_screen_mode: false,
+      update_multi: true,
+    },
+    header: {
+      title: { tag: 'plain_text', content: '🔐 需要权限确认' },
+      subtitle: {
+        tag: 'plain_text',
+        content: crossDir ? '⚠️ 跨目录操作' : toolName,
+      },
+      template: crossDir ? 'red' : 'orange',
+      padding: '12px 12px 12px 12px',
+      icon: { tag: 'standard_icon', token: 'lock-chat_filled' },
+    },
+    body: { elements },
   }
 }
 
@@ -278,42 +430,256 @@ describe('Feishu: event parsing', () => {
 })
 
 describe('Feishu: permission card', () => {
-  it('builds valid card structure', () => {
-    const card = buildPermissionCard('Bash', { command: 'npm test' }, 'abcde')
+  // Helpers to reach into Schema 2.0 body.elements
+  function getBodyElements(card: Record<string, unknown>): any[] {
+    return ((card.body as any).elements ?? []) as any[]
+  }
+  function getActionRow(card: Record<string, unknown>): any {
+    return getBodyElements(card).find((el) => el.tag === 'column_set')
+  }
+  function getButtons(card: Record<string, unknown>): any[] {
+    return getActionRow(card).columns.map(
+      (c: any) => c.elements.find((e: any) => e.tag === 'button'),
+    )
+  }
 
+  // ----- Schema 2.0 regression -----
+
+  it('uses Schema 2.0 with body.elements wrapper (not top-level elements)', () => {
+    const card = buildPermissionCard('Bash', { command: 'npm test' }, 'abc')
     expect(card.schema).toBe('2.0')
-    expect((card.header as any).title.content).toContain('权限确认')
-    expect((card.elements as any[]).length).toBe(2) // markdown + action
-
-    const actionElement = (card.elements as any[])[1]
-    expect(actionElement.tag).toBe('action')
-    expect(actionElement.actions.length).toBe(2) // allow + deny buttons
+    expect(card.elements).toBeUndefined() // old bug had top-level elements
+    expect((card.body as any).elements).toBeDefined()
+    expect((card.config as any).update_multi).toBe(true)
+    expect((card.config as any).wide_screen_mode).toBe(false) // mobile-first
   })
 
-  it('allow button has correct value', () => {
-    const card = buildPermissionCard('Read', {}, 'xyz12')
-    const allowBtn = (card.elements as any[])[1].actions[0]
-
-    expect(allowBtn.value.action).toBe('permit')
-    expect(allowBtn.value.requestId).toBe('xyz12')
-    expect(allowBtn.value.allowed).toBe(true)
+  it('header has title, subtitle, template, icon', () => {
+    const card = buildPermissionCard('Bash', { command: 'npm test' }, 'abc')
+    const header = card.header as any
+    expect(header.title.content).toContain('权限确认')
+    expect(header.subtitle.content).toBe('Bash')
+    expect(header.template).toBe('orange')
+    expect(header.icon.tag).toBe('standard_icon')
   })
 
-  it('deny button has correct value', () => {
-    const card = buildPermissionCard('Read', {}, 'xyz12')
-    const denyBtn = (card.elements as any[])[1].actions[1]
+  // ----- Three buttons -----
 
-    expect(denyBtn.value.action).toBe('permit')
-    expect(denyBtn.value.requestId).toBe('xyz12')
-    expect(denyBtn.value.allowed).toBe(false)
+  it('has three action buttons in order: 允许 | 永久允许 | 拒绝', () => {
+    const card = buildPermissionCard('Read', {}, 'xyz')
+    const [allow, always, deny] = getButtons(card)
+    expect(allow.text.content).toContain('允许')
+    expect(allow.type).toBe('primary')
+    expect(always.text.content).toContain('永久允许')
+    expect(always.type).toBe('default')
+    expect(deny.text.content).toContain('拒绝')
+    expect(deny.type).toBe('danger')
   })
 
-  it('truncates long input preview', () => {
-    const longInput = { command: 'x'.repeat(500) }
-    const card = buildPermissionCard('Bash', longInput, 'abc')
-    const mdElement = (card.elements as any[])[0]
+  it('允许 button carries allowed=true and no rule', () => {
+    const card = buildPermissionCard('Read', {}, 'req-1')
+    const [allow] = getButtons(card)
+    expect(allow.value).toEqual({
+      action: 'permit',
+      requestId: 'req-1',
+      allowed: true,
+    })
+    expect(allow.value.rule).toBeUndefined()
+  })
 
-    expect(mdElement.content).toContain('…')
+  it('永久允许 button carries allowed=true + rule=always', () => {
+    const card = buildPermissionCard('Read', {}, 'req-2')
+    const always = getButtons(card)[1]
+    expect(always.value).toEqual({
+      action: 'permit',
+      requestId: 'req-2',
+      allowed: true,
+      rule: 'always',
+    })
+  })
+
+  it('拒绝 button carries allowed=false and no rule', () => {
+    const card = buildPermissionCard('Read', {}, 'req-3')
+    const deny = getButtons(card)[2]
+    expect(deny.value).toEqual({
+      action: 'permit',
+      requestId: 'req-3',
+      allowed: false,
+    })
+  })
+
+  // ----- Tool summary rendering -----
+
+  it('renders Write with ✏️ 写入文件 header and file path target', () => {
+    const card = buildPermissionCard(
+      'Write',
+      { file_path: '/tmp/output.txt', content: 'hi' },
+      'req',
+    )
+    const elements = getBodyElements(card)
+    expect(elements[0].content).toContain('✏️')
+    expect(elements[0].content).toContain('写入文件')
+    expect(elements[0].content).toContain('`Write`')
+    // Target rendered as fenced code block
+    expect(elements[1].content).toContain('/tmp/output.txt')
+    expect(elements[1].content.startsWith('```')).toBe(true)
+  })
+
+  it('renders Edit with ✏️ 修改文件', () => {
+    const card = buildPermissionCard(
+      'Edit',
+      { file_path: '/a/b.ts', old_string: 'x', new_string: 'y' },
+      'req',
+    )
+    expect(getBodyElements(card)[0].content).toContain('修改文件')
+  })
+
+  it('renders Bash with 🖥️ 执行命令 and command target', () => {
+    const card = buildPermissionCard(
+      'Bash',
+      { command: 'rm -rf /tmp/x' },
+      'req',
+    )
+    const elements = getBodyElements(card)
+    expect(elements[0].content).toContain('🖥️')
+    expect(elements[0].content).toContain('执行命令')
+    expect(elements[1].content).toContain('rm -rf /tmp/x')
+  })
+
+  it('truncates very long Bash commands to 160 chars', () => {
+    const longCmd = 'echo ' + 'x'.repeat(500)
+    const card = buildPermissionCard('Bash', { command: longCmd }, 'req')
+    const targetEl = getBodyElements(card)[1]
+    expect(targetEl.content).toContain('…')
+    // Fenced code wraps ~10 extra chars
+    expect(targetEl.content.length).toBeLessThanOrEqual(180)
+  })
+
+  it('renders Grep with 🔍 搜索内容 and pattern target', () => {
+    const card = buildPermissionCard(
+      'Grep',
+      { pattern: 'TODO', path: '/src' },
+      'req',
+    )
+    const elements = getBodyElements(card)
+    expect(elements[0].content).toContain('🔍')
+    expect(elements[1].content).toContain('TODO')
+  })
+
+  it('renders WebFetch with 🌐 访问网页 and url target', () => {
+    const card = buildPermissionCard(
+      'WebFetch',
+      { url: 'https://example.com/api' },
+      'req',
+    )
+    const elements = getBodyElements(card)
+    expect(elements[0].content).toContain('🌐')
+    expect(elements[0].content).toContain('访问网页')
+    expect(elements[1].content).toContain('https://example.com/api')
+  })
+
+  it('falls back to 🔧 <toolName> for unknown tools', () => {
+    const card = buildPermissionCard('CustomTool', { foo: 'bar' }, 'req')
+    expect(getBodyElements(card)[0].content).toContain('🔧')
+    expect(getBodyElements(card)[0].content).toContain('CustomTool')
+  })
+
+  it('has no target line when input is empty', () => {
+    const card = buildPermissionCard('Bash', {}, 'req')
+    const elements = getBodyElements(card)
+    // elements: [header_md, hr, action_column_set]
+    expect(elements[1].tag).toBe('hr')
+  })
+
+  // ----- Cross-directory detection -----
+
+  it('does NOT show cross-dir warning when file is inside workDir', () => {
+    const card = buildPermissionCard(
+      'Write',
+      { file_path: '/Users/me/proj/src/a.ts' },
+      'req',
+      '/Users/me/proj',
+    )
+    const elements = getBodyElements(card)
+    const hasWarn = elements.some(
+      (el) => typeof el.content === 'string' && el.content.includes('项目目录之外'),
+    )
+    expect(hasWarn).toBe(false)
+    expect((card.header as any).template).toBe('orange')
+    expect((card.header as any).subtitle.content).toBe('Write')
+  })
+
+  it('DOES show cross-dir warning when file is outside workDir (red template)', () => {
+    const card = buildPermissionCard(
+      'Write',
+      { file_path: '/tmp/evil.sh' },
+      'req',
+      '/Users/me/proj',
+    )
+    const elements = getBodyElements(card)
+    const warn = elements.find(
+      (el) => typeof el.content === 'string' && el.content.includes('项目目录之外'),
+    )
+    expect(warn).toBeDefined()
+    expect((card.header as any).template).toBe('red')
+    expect((card.header as any).subtitle.content).toContain('跨目录')
+  })
+
+  it('does NOT check cross-dir for Bash (no filePath)', () => {
+    const card = buildPermissionCard(
+      'Bash',
+      { command: 'rm -rf /tmp/x' },
+      'req',
+      '/Users/me/proj',
+    )
+    expect((card.header as any).template).toBe('orange')
+  })
+
+  it('does not warn when workDir is not provided', () => {
+    const card = buildPermissionCard(
+      'Write',
+      { file_path: '/tmp/x.ts' },
+      'req',
+      // workDir omitted
+    )
+    const elements = getBodyElements(card)
+    const hasWarn = elements.some(
+      (el) => typeof el.content === 'string' && el.content.includes('项目目录之外'),
+    )
+    expect(hasWarn).toBe(false)
+  })
+})
+
+describe('Feishu: isOutsideWorkDir', () => {
+  it('returns false for file inside workDir', () => {
+    expect(isOutsideWorkDir('/Users/me/proj/src/a.ts', '/Users/me/proj')).toBe(false)
+  })
+
+  it('returns false for file directly in workDir', () => {
+    expect(isOutsideWorkDir('/Users/me/proj/a.ts', '/Users/me/proj')).toBe(false)
+  })
+
+  it('returns true for file in a sibling directory', () => {
+    expect(isOutsideWorkDir('/Users/me/other/a.ts', '/Users/me/proj')).toBe(true)
+  })
+
+  it('returns true for /tmp file', () => {
+    expect(isOutsideWorkDir('/tmp/evil.sh', '/Users/me/proj')).toBe(true)
+  })
+
+  it('handles workDir with trailing slash', () => {
+    expect(isOutsideWorkDir('/Users/me/proj/src/a.ts', '/Users/me/proj/')).toBe(false)
+  })
+
+  it('resolves relative paths against workDir', () => {
+    expect(isOutsideWorkDir('src/a.ts', '/Users/me/proj')).toBe(false)
+    expect(isOutsideWorkDir('../other/a.ts', '/Users/me/proj')).toBe(true)
+  })
+
+  it('does not match prefix collisions (proj vs proj2)', () => {
+    // /Users/me/proj2/a.ts starts with "/Users/me/proj" as a string
+    // but is NOT inside /Users/me/proj
+    expect(isOutsideWorkDir('/Users/me/proj2/a.ts', '/Users/me/proj')).toBe(true)
   })
 })
 
