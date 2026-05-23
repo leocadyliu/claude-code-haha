@@ -1122,6 +1122,49 @@ function buildVirtualTranscriptWindow(
   }
 }
 
+const VIRTUAL_SPACER_CHUNK_PX = 800
+
+function VirtualSpacer({ height, position }: { height: number; position: 'top' | 'bottom' }) {
+  if (height <= 0) return null
+  if (height <= VIRTUAL_SPACER_CHUNK_PX) {
+    return (
+      <div
+        data-virtual-spacer={position}
+        aria-hidden="true"
+        style={{ height }}
+      />
+    )
+  }
+
+  // Splitting the spacer into chunks lets the WebView keep painting placeholder
+  // boxes via content-visibility:auto + contain-intrinsic-size, instead of
+  // leaving a single huge area unpainted while React reconciles the window.
+  const chunkCount = Math.max(1, Math.ceil(height / VIRTUAL_SPACER_CHUNK_PX))
+  const chunkHeight = Math.floor(height / chunkCount)
+  const remainder = height - chunkHeight * chunkCount
+  const chunks: Array<{ key: string; px: number }> = []
+  for (let i = 0; i < chunkCount; i++) {
+    const px = i === chunkCount - 1 ? chunkHeight + remainder : chunkHeight
+    chunks.push({ key: `${position}-${i}`, px })
+  }
+
+  return (
+    <div data-virtual-spacer={position} aria-hidden="true">
+      {chunks.map((chunk) => (
+        <div
+          key={chunk.key}
+          data-virtual-spacer-chunk={position}
+          style={{
+            height: chunk.px,
+            contentVisibility: 'auto',
+            containIntrinsicSize: `0 ${chunk.px}px`,
+          }}
+        />
+      ))}
+    </div>
+  )
+}
+
 const MeasuredRenderItem = memo(function MeasuredRenderItem({
   itemKey,
   onHeightChange,
@@ -1726,12 +1769,8 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
           ref={scrollContentRef}
           className={compact ? 'mx-auto max-w-full' : 'mx-auto max-w-[860px]'}
         >
-          {virtualTranscriptWindow.enabled && virtualTranscriptWindow.beforeHeight > 0 ? (
-            <div
-              data-virtual-spacer="top"
-              aria-hidden="true"
-              style={{ height: virtualTranscriptWindow.beforeHeight }}
-            />
+          {virtualTranscriptWindow.enabled ? (
+            <VirtualSpacer height={virtualTranscriptWindow.beforeHeight} position="top" />
           ) : null}
 
           {virtualTranscriptWindow.items.map(({ item, index }) => {
@@ -1753,12 +1792,8 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
             )
           })}
 
-          {virtualTranscriptWindow.enabled && virtualTranscriptWindow.afterHeight > 0 ? (
-            <div
-              data-virtual-spacer="bottom"
-              aria-hidden="true"
-              style={{ height: virtualTranscriptWindow.afterHeight }}
-            />
+          {virtualTranscriptWindow.enabled ? (
+            <VirtualSpacer height={virtualTranscriptWindow.afterHeight} position="bottom" />
           ) : null}
 
           {streamingText.trim() && (

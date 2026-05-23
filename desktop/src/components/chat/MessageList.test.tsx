@@ -643,6 +643,49 @@ describe('MessageList nested tool calls', () => {
     expect(container.querySelector('[data-virtual-message-item]')).not.toBeNull()
   })
 
+  it('splits large virtualization spacers into content-visibility chunks', async () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: Array.from({ length: 240 }, (_, index) => ({
+            id: `assistant-${index}`,
+            type: 'assistant_text',
+            content: `assistant transcript line ${index}`,
+            timestamp: index,
+          })),
+        }),
+      },
+    })
+
+    const { container } = render(<MessageList />)
+    const scrollArea = container.querySelector('.chat-scroll-area') as HTMLElement
+    Object.defineProperty(scrollArea, 'clientHeight', { configurable: true, value: 500 })
+    Object.defineProperty(scrollArea, 'scrollHeight', { configurable: true, value: 240 * 200 })
+    await waitForProgrammaticScrollReset()
+
+    // Scroll to middle so both top and bottom spacers are present
+    scrollArea.scrollTop = 20_000
+    await act(async () => {
+      fireEvent.scroll(scrollArea)
+    })
+
+    const topChunks = container.querySelectorAll('[data-virtual-spacer-chunk="top"]')
+    const bottomChunks = container.querySelectorAll('[data-virtual-spacer-chunk="bottom"]')
+    expect(topChunks.length).toBeGreaterThan(1)
+    expect(bottomChunks.length).toBeGreaterThan(1)
+
+    const firstTopChunk = topChunks[0] as HTMLElement
+    expect(firstTopChunk.style.contentVisibility).toBe('auto')
+    expect(firstTopChunk.style.containIntrinsicSize).toMatch(/^0 \d+px$/)
+
+    // Items inside the active window must NOT carry content-visibility (this
+    // is the regression guard that previous content-visibility rollout hit).
+    const visibleItems = container.querySelectorAll('[data-virtual-message-item]')
+    for (const item of visibleItems) {
+      expect((item as HTMLElement).style.contentVisibility).toBe('')
+    }
+  })
+
   it('renders sub-agent tool calls inline beneath the parent agent tool call', () => {
     useChatStore.setState({
       sessions: {
