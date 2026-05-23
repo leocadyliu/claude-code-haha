@@ -12,6 +12,7 @@ type Props = {
   content: string
   variant?: 'default' | 'document' | 'compact'
   className?: string
+  cache?: boolean
   onLinkClick?: (href: string, event: ReactMouseEvent<HTMLDivElement>) => boolean | void
 }
 
@@ -304,6 +305,38 @@ function parseMarkdown(content: string): { html: string; codeBlocks: CodeBlock[]
   return { html, codeBlocks, mathBlocks }
 }
 
+type MarkdownParseResult = ReturnType<typeof parseMarkdown>
+
+const MARKDOWN_PARSE_CACHE_MAX_ENTRIES = 48
+const MARKDOWN_PARSE_CACHE_MAX_CHARS = 1_800_000
+const markdownParseCache = new Map<string, MarkdownParseResult>()
+let markdownParseCacheChars = 0
+
+function getCachedMarkdownParse(content: string): MarkdownParseResult {
+  const cached = markdownParseCache.get(content)
+  if (cached) {
+    markdownParseCache.delete(content)
+    markdownParseCache.set(content, cached)
+    return cached
+  }
+
+  const parsed = parseMarkdown(content)
+  markdownParseCache.set(content, parsed)
+  markdownParseCacheChars += content.length
+
+  while (
+    markdownParseCache.size > MARKDOWN_PARSE_CACHE_MAX_ENTRIES ||
+    markdownParseCacheChars > MARKDOWN_PARSE_CACHE_MAX_CHARS
+  ) {
+    const oldestContent = markdownParseCache.keys().next().value
+    if (typeof oldestContent !== 'string') break
+    markdownParseCache.delete(oldestContent)
+    markdownParseCacheChars -= oldestContent.length
+  }
+
+  return parsed
+}
+
 const BASE_PROSE_CLASSES = `markdown-prose prose prose-sm min-w-0 max-w-none break-words [overflow-wrap:anywhere] text-[var(--color-text-primary)]
   prose-headings:text-[var(--color-text-primary)] prose-headings:font-semibold
   prose-p:my-2 prose-p:leading-relaxed
@@ -363,8 +396,11 @@ function getProseClasses(variant: 'default' | 'document' | 'compact', className?
     .join(' ')
 }
 
-export function MarkdownRenderer({ content, variant = 'default', className, onLinkClick }: Props) {
-  const { html, codeBlocks, mathBlocks } = useMemo(() => parseMarkdown(content), [content])
+export function MarkdownRenderer({ content, variant = 'default', className, cache = true, onLinkClick }: Props) {
+  const { html, codeBlocks, mathBlocks } = useMemo(
+    () => cache ? getCachedMarkdownParse(content) : parseMarkdown(content),
+    [cache, content],
+  )
   const proseClasses = useMemo(
     () => getProseClasses(variant, className),
     [variant, className],

@@ -123,7 +123,7 @@ describe('MessageList nested tool calls', () => {
     })
   })
 
-  it('keeps full long transcripts mounted so variable-height messages cannot leave spacer gaps', () => {
+  it('windows long transcripts instead of mounting every historical message at once', () => {
     useChatStore.setState({
       sessions: {
         [ACTIVE_TAB]: makeSessionState({
@@ -147,13 +147,14 @@ describe('MessageList nested tool calls', () => {
 
     const { container } = render(<MessageList />)
 
-    expect(screen.getByText('assistant transcript line 0')).toBeTruthy()
     expect(screen.getByText('assistant transcript line 219')).toBeTruthy()
-    expect(container.querySelectorAll('[data-message-shell="assistant"]').length).toBe(220)
-    expect(container.querySelector('[data-virtual-message-item]')).toBeNull()
+    expect(screen.queryByText('assistant transcript line 0')).toBeNull()
+    expect(container.querySelectorAll('[data-message-shell="assistant"]').length).toBeLessThan(220)
+    expect(container.querySelector('[data-virtual-message-item]')).not.toBeNull()
+    expect(container.querySelector('[data-virtual-spacer="top"]')).not.toBeNull()
   })
 
-  it('marks transcript items as offscreen-renderable without virtualizing variable-height rows', () => {
+  it('keeps small transcripts fully mounted without deferred browser painting', () => {
     useChatStore.setState({
       sessions: {
         [ACTIVE_TAB]: makeSessionState({
@@ -180,10 +181,38 @@ describe('MessageList nested tool calls', () => {
 
     expect(renderItems).toHaveLength(2)
     for (const item of renderItems) {
-      expect(item.className).toContain('[content-visibility:auto]')
-      expect(item.className).toContain('[contain-intrinsic-size:auto_180px]')
+      expect(item.className).not.toContain('content-visibility')
+      expect(item.className).not.toContain('contain-intrinsic-size')
     }
     expect(container.querySelector('[data-virtual-message-item]')).toBeNull()
+  })
+
+  it('virtualizes short message lists when their content is very large', () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'user-huge',
+              type: 'user_text',
+              content: '超长设计内容 '.repeat(24_000),
+              timestamp: 1,
+            },
+            {
+              id: 'assistant-tail',
+              type: 'assistant_text',
+              content: 'latest assistant reply',
+              timestamp: 2,
+            },
+          ],
+        }),
+      },
+    })
+
+    const { container } = render(<MessageList />)
+
+    expect(container.querySelector('[data-virtual-message-item]')).not.toBeNull()
+    expect(screen.getByText('latest assistant reply')).toBeTruthy()
   })
 
   it('filters duplicate unresolved AskUserQuestion cards while a matching permission is pending', () => {
@@ -533,7 +562,7 @@ describe('MessageList nested tool calls', () => {
     expect(screen.queryByText('local_agent')).toBeNull()
   })
 
-  it('restores the full transcript when scrolling away from latest', async () => {
+  it('renders the historical window when scrolling away from latest', async () => {
     useChatStore.setState({
       sessions: {
         [ACTIVE_TAB]: makeSessionState({
@@ -559,11 +588,11 @@ describe('MessageList nested tool calls', () => {
     })
 
     expect(screen.getByText('assistant transcript line 0')).toBeTruthy()
-    expect(screen.getByText('assistant transcript line 219')).toBeTruthy()
-    expect(container.querySelectorAll('[data-message-shell="assistant"]').length).toBe(220)
+    expect(screen.queryByText('assistant transcript line 219')).toBeNull()
+    expect(container.querySelectorAll('[data-message-shell="assistant"]').length).toBeLessThan(220)
   })
 
-  it('keeps long histories with tool-call groups mounted while scrolling history', async () => {
+  it('keeps tool-call groups reachable while scrolling virtualized history', async () => {
     useChatStore.setState({
       sessions: {
         [ACTIVE_TAB]: makeSessionState({
@@ -601,7 +630,7 @@ describe('MessageList nested tool calls', () => {
     Object.defineProperty(scrollArea, 'scrollHeight', { configurable: true, value: 222 * 112 })
     await waitForProgrammaticScrollReset()
 
-    expect(screen.getByText('Read')).toBeTruthy()
+    expect(screen.queryByText('Read')).toBeNull()
     expect(screen.getByText('assistant transcript line 219')).toBeTruthy()
 
     scrollArea.scrollTop = 0
@@ -610,8 +639,8 @@ describe('MessageList nested tool calls', () => {
     })
 
     expect(screen.getByText('Read')).toBeTruthy()
-    expect(screen.getByText('assistant transcript line 219')).toBeTruthy()
-    expect(container.querySelector('[data-virtual-message-item]')).toBeNull()
+    expect(screen.queryByText('assistant transcript line 219')).toBeNull()
+    expect(container.querySelector('[data-virtual-message-item]')).not.toBeNull()
   })
 
   it('renders sub-agent tool calls inline beneath the parent agent tool call', () => {
