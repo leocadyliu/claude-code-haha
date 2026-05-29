@@ -3,8 +3,7 @@ use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Runtime, WebviewBu
 
 const PREVIEW_LABEL: &str = "preview";
 
-/// M1 placeholder init script; replaced by the real preview-agent bundle in a later milestone.
-const PREVIEW_INIT_SCRIPT: &str = "window.__PREVIEW_AGENT_READY__ = true;";
+const PREVIEW_INIT_SCRIPT: &str = include_str!("../resources/preview-agent.js");
 
 #[derive(Default)]
 pub struct PreviewState(Mutex<PreviewInner>);
@@ -63,7 +62,7 @@ pub async fn preview_open<R: Runtime>(
         .get_window(crate::MAIN_WINDOW_LABEL)
         .ok_or_else(|| "main window not found".to_string())?;
     let builder = WebviewBuilder::new(PREVIEW_LABEL, WebviewUrl::External(target))
-        .initialization_script(PREVIEW_INIT_SCRIPT);
+        .initialization_script_for_all_frames(PREVIEW_INIT_SCRIPT);
     main.add_child(
         builder,
         LogicalPosition::new(bounds.x, bounds.y),
